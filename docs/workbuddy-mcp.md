@@ -4,6 +4,8 @@
 
 两种形态可以并存：它们读写同一套文件（`<书库根>/novels/*.md` 与 `<书库根>/.novel-writer/`），不存在数据迁移问题。
 
+> **版本前提**：本文随 `feat/local-custom` 分支维护。§1.1 的宿主能力矩阵、§5 的 `rawWriting` 告警与报告默认精简，是**该分支相对上游 7.3.2 新增的行为**。若你用未打补丁的上游版本照本文操作，这些输出不会出现，其余步骤（安装、配置、验证、排错）完全一致。
+
 ---
 
 ## 1. 先明确能力边界
@@ -16,7 +18,7 @@
 | `ctx.systemPrompt.section` | `lib/index.js` ×3 | 否 | **不注入**工作流提示词 → 需用客户端技能文件补（见 §4） |
 | `ctx.inject(["webServer"])` | `lib/index.js` | 否 | 5 个 `/api/dsh-novel-writer/*` 面板路由无人消费，**工具本身不受影响** |
 | `ctx.inject(["skills"])` | `lib/index.js` | 否 | 内置技能不自动注册 → 需手工安装（见 §4） |
-| `ctx.on("llm/stream")` | `lib/index.js` | 否 | **「非净化模式」的软化重试兜底失效**（见 §6） |
+| `ctx.on("llm/stream")` | `lib/index.js` | 否 | **「非净化模式」的软化重试兜底失效**，但 `novel_sentence_config` 会如实告警（见 §5） |
 | `ctx.slots.inject` + `sidebar.panellist` / `main` | `lib/client.js` | 否 | **面板 UI 不出现**（`client.js` 根本不会被加载） |
 
 因此：
@@ -31,6 +33,20 @@
 | 非净化模式的流层兜底重试 | ❌ | ✅ |
 
 工具返回的是**纯文本**（`mcp/server.mjs` 的 `renderToolText`），用 `<path>` / `<type>` / `<content>` 包裹，客户端里看到的是文本报告，不是图形面板。
+
+### 1.1 让插件自己报告能力边界
+
+`lib/host.js` 会在 `apply()` 时探测上述 6 个接触面。调 `novel_diagnose`（参数 `{"action":"report"}`）会在报告里带一段**宿主能力矩阵**，形如：
+
+```
+· 提示｜宿主形态：MCP 客户端（2/6 项能力可用）
+    工具注册：可用；系统提示注入：可用；面板 HTTP 路由：不可用；技能注册：不可用；
+    流层兜底（llm/stream）：不可用；侧栏席位：不可用
+```
+
+口径是三态而不是布尔：**可用 / 不可用 / 未知**。「未知」指只能靠 `ctx.inject` 回调证明的能力（`webServer`、`skills`），注册期无法可靠探测——插件宁可标未知也不猜。MCP 入口会显式传 `hostMode: "mcp"`，所以这两项在 MCP 下是确证的「不可用」。
+
+用途：换客户端、升级版本后，先用它确认能力面有没有变，别靠猜。
 
 > Node 侧没有任何 `@deepseek-ai/*` 依赖；唯一的宿主包引用在 `lib/client.js:89`，且在 `try/catch` 内、取不到即自绘回退。
 
@@ -239,14 +255,22 @@ npm test          # 只跑测试
 | `enabled` | 功能总开关。关闭后 `novel_style_check` 直接报错，`novel_sentence_analysis` 返回桩结果 |
 | `tools` | 单工具开关，键必须是 `novel_*` 工具名，如 `{"novel_draft": true}` |
 | `features` | 功能开关：`semanticEmbedding` / `lexiconFirst` / `emotionCaveat` / `genreTheme` / `webnovelVibe` / `rawWriting` |
-| `leanWorkflow` | `true` 时报告类工具默认走精简输出，省 token，长篇建议开 |
+| `leanWorkflow` | `true` 时报告类工具默认走精简输出，省 token，长篇建议开。**MCP 形态下已经默认精简**（见下） |
 | `chatThreshold` | 实时聊天写作的提问节奏（100~5000 字，默认 400），`0` 恢复默认 |
 | `systemPromptMode` | 仅对 DSH 生效（MCP 下无注入通道），可忽略 |
 
-两个容易踩的点：
+三个容易踩的点：
 
 - **`novel_draft`（草稿镜像）默认关闭。** 想在对话里逐段写半成品（只追加、完成前不碰正式章节），先 `{"action":"set","tools":{"novel_draft":true}}`。
-- **`rawWriting`（非净化直白模式）在 MCP 下只有半个开关。** 它依赖宿主的 `llm/stream` 钩子做「软化重试」，MCP 客户端没有这个钩子，代码会静默跳过（`installRawModeGuard` 里 `return next()`）。开启它不会报错，但**兜底不生效**——而 DSH 侧还有「双重确认 + 承诺输入」的人为闸门，MCP 下也没有。建议保持关闭。
+- **报告默认是精简版。** `novel_style_report` / `novel_sentence_analysis` 在 MCP 下未显式传 `brief` 时走精简输出（开头标 `【风格画像·精简】`）。要看完整六维细节、氛围光谱、锚包与骨架，显式传 `"brief": false`。省的是**上下文 token**，不是推理成本——推理本来就在本地跑。
+- **`rawWriting`（非净化直白模式）在 MCP 下只有半个开关。** 它依赖宿主的 `llm/stream` 钩子做「软化重试」，MCP 客户端没有这个钩子（`installRawModeGuard` 里直接 `return`，钩子从未安装）。区别是**现在它会说实话**：开启后 `novel_sentence_config` 会返回一条 warning：
+
+  ```
+  ⚠ 非净化模式（rawWriting）已开启，但当前宿主没有 llm/stream 钩子：
+    模型在场景里自我刹车时不会丢弃重试，本开关实际不生效。
+  ```
+
+  `get` 与 `set` 都会提示（`warnings` 里 `code: "raw-writing-inert"`），避免只看到「已开启」而误以为生效。DSH 侧还有「双重确认 + 承诺输入」的人为闸门，MCP 下没有。**建议保持关闭。**
 
 ---
 
@@ -279,9 +303,9 @@ npm test          # 只跑测试
 | 安装成本 | 一份 JSON + 一个技能文件 | `dsh plugin add dsh-novel-writer` |
 | 界面 | 无（纯文本报告） | 右侧栏面板 + 开关页 + 诊断页 |
 | 提示词注入 | 靠技能文件 | 自动，按档位/场景注入 |
-| 流层兜底 | 无 | 有（非净化模式重试） |
+| 流层兜底 | 无（切 `rawWriting` 会告警） | 有（非净化模式重试） |
 | 升级方式 | `git pull` + `npm ci` | `dsh plugin add` 重装 |
-| 定制成本 | 改本地文件即生效，无需发布 | 同理，但要处理构建产物 |
+| 定制成本 | 改本地文件即生效，无需发布 | 同理；只有改面板 UI（`tools/client-src/` → `lib/client.js`）才要 `npm run build` |
 
 两条路可以同时用：同一个书库根、同一份状态文件，DSH 里用面板调开关，MCP 客户端里用工具跑分析，互不冲突（**并发写同一本书时注意别同时改同一章**）。
 

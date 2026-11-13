@@ -239,7 +239,9 @@ const IGNORE_PLUGIN_LOAD_ERROR = process.argv.slice(2).includes("--ignore-plugin
 let INIT_FAILED = null;
 try {
   const plugin = await import(pathToFileURL(join(PLUGIN_DIR, "lib", "index.js")).href);
-  await plugin.apply(ctx, { root: LIBRARY_ROOT });
+  // hostMode 让插件知道自己在 MCP 宿主里跑：报告类工具默认精简（省上下文）、
+  // rawWriting 这类依赖 llm/stream 的开关会如实告警、novel_diagnose 报告附带能力矩阵。
+  await plugin.apply(ctx, { root: LIBRARY_ROOT, hostMode: "mcp" });
 } catch (error) {
   if (!IGNORE_PLUGIN_LOAD_ERROR) {
     logError("插件加载失败，服务器退出（如需保留服务器并回 JSON-RPC 错误帧，改用 --ignore-plugin-load-error）：", error);

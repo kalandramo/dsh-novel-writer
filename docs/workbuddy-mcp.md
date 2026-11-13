@@ -304,7 +304,7 @@ npm test          # 只跑测试
 | 界面 | 无（纯文本报告） | 右侧栏面板 + 开关页 + 诊断页 |
 | 提示词注入 | 靠技能文件 | 自动，按档位/场景注入 |
 | 流层兜底 | 无（切 `rawWriting` 会告警） | 有（非净化模式重试） |
-| 升级方式 | `git pull` + `npm ci` | `dsh plugin add` 重装 |
+| 升级方式 | `git pull` + `npm ci`；有定制时见 §9 | `dsh plugin add` 重装 |
 | 定制成本 | 改本地文件即生效，无需发布 | 同理；只有改面板 UI（`tools/client-src/` → `lib/client.js`）才要 `npm run build` |
 
 两条路可以同时用：同一个书库根、同一份状态文件，DSH 里用面板调开关，MCP 客户端里用工具跑分析，互不冲突（**并发写同一本书时注意别同时改同一章**）。
@@ -332,3 +332,97 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 ```
 
 看到 `已注册 22 个工具` 就通了。
+
+---
+
+## 9. 跟进上游更新（fork 场景）
+
+前面的步骤都以「本地代码就是你要用的代码」为前提。一旦你在这份代码上做了定制，就要区分两件事：**上游的演进**和**你的改动**。混在一起后，某天上游发版时你会不知道哪些冲突该保留。
+
+### 9.1 双远端布局
+
+```
+origin    git@github.com:<你的账号>/dsh-novel-writer.git    ← 你的 fork，定制分支推这里
+upstream  git@github.com:siweina/dsh-novel-writer.git       ← 上游真源，只读
+```
+
+```bash
+# 一次性配置
+git remote add upstream git@github.com:siweina/dsh-novel-writer.git
+git fetch upstream
+
+# main 只跟上游，不承载定制
+git branch --set-upstream-to=upstream/main main
+
+# 裸 push 一律走 fork，避免在 main 上敲 git push 时对着上游报权限错
+git config remote.pushDefault origin
+
+# 把上游设为只读：误推会在本地就失败，不发网络请求
+git remote set-url --push upstream no_push
+```
+
+验证：
+
+```bash
+git remote -v          # upstream 的 (push) 应显示 no_push
+git branch -vv         # main 跟踪 upstream/main，定制分支跟踪 origin/<分支>
+git rev-list --count main..upstream/main    # 落后上游多少个提交
+```
+
+### 9.2 日常同步
+
+```bash
+# 1. 上游 main 快进（main 上没有定制提交，永远可以直接快进）
+git checkout main
+git pull
+
+# 2. 把定制提交嫁接到新版上游之上
+git checkout feat/<你的分支>
+git rebase main
+
+# 3. 上游改过依赖或分析口径时，必须重装并重跑全套
+npm ci
+npm run check
+```
+
+`git pull` 在 `main` 上不带参数就会走 upstream（跟踪关系已设好）。**不要用 `git merge` 代替 rebase**——定制分支会长期存在，merge 会让提交图逐渐难以阅读，rebase 能让「我的改动」始终是干净的一层。
+
+第 3 步不能省。`npm run check` 包含 `build:check`、`check-release` 与全部测试套件（当前 38 个），其中 `check-release` 会校验版本号在 `package.json`、lockfile、`server.json`、CHANGELOG 与 23 个页面之间是否一致。上游一旦 bump 版本而你没跟上，这里会直接报错。
+
+### 9.3 冲突集中在哪里
+
+`lib/index.js` 与 `lib/core.js` 是手写源文件（单文件 300~400 KB），任何定制都大概率与上游改动撞在这里。降低冲突成本的三条纪律：
+
+1. **新增文件优先**。把逻辑放进新模块（例如 `lib/host.js`），`index.js` 里只留一两个调用点（如 `apply()` 开头的探测、某个工具 execute 里的一个判断）。冲突范围就从「几百行」缩到「一两行」。
+2. **不在大文件里做格式化改动**。重排缩进、改引号风格会让整个区域变成冲突块，上游一更新就无从合并。
+3. **一次提交一件事**。把「修 A」「加 B」拆开，rebase 冲突时可以用 `git rebase --skip` 单独丢弃某个不再需要的提交。
+
+遇到冲突时，判断标准是**上游是否已经修了同一件事**。如果上游已经修了你的定制点（这种情况在活跃项目上很常见），直接 `git rebase --skip` 丢掉自己的提交，比强行保留更省事。
+
+### 9.4 版本号与 tag
+
+不要改 `package.json` 的 `name` 和 `mcpName`。这两个字段与 npm 包归属、MCP Registry 的 `io.github.<上游账号>/...` 校验、`server.json`、`smithery.yaml` 联动，改一处会同时破坏 `dsh plugin add` 和 registry 发布。
+
+定制版用后缀区分：
+
+```jsonc
+// package.json
+"version": "7.3.2-murphy.1"       // 上游版本 + 标识 + 序号
+```
+
+对应 tag 用 `v7.3.2-murphy.1`。**不要使用 `v7.3.2`**——`git fetch upstream` 已经把所有上游 tag 拉到本地（`v6.7.0` ~ 当前版本），在 fork 里打同名 tag 会让 `git push --tags` 直接失败。
+
+顺带一个有用的性质：上游的发布作业带 `if: startsWith(github.ref, 'refs/tags/')` 门限，推分支只跑测试矩阵、不会触发 npm publish。所以在 fork 的 branch 上随便推，不存在误发布风险。
+
+### 9.5 切换分支就在切换行为
+
+MCP 配置里写的是**文件路径**（`<仓库路径>/mcp/server.mjs`），与分支无关。所以：
+
+```bash
+git checkout main            # 客户端重启后跑上游原版行为
+git checkout feat/<你的分支>  # 客户端重启后跑定制行为
+```
+
+配置一个字都不用改。这意味着升级验证可以这样做：先在 `main` 上跑一遍冒烟确认上游本身没问题，再切回定制分支定位是不是自己的改动引入的。
+
+唯一的要求是**改完代码要重启 MCP 客户端**——`server.mjs` 是长驻进程，工具注册发生在启动时，热改文件不会生效。
